@@ -5,3 +5,4 @@ torchvision
 gym
 pandas
 scipy
+scikit-learn
