@@ -9,24 +9,27 @@ from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 
 
-class PolicyNetwork(nn.Module):
+class A2CNetwork(nn.Module):
     def __init__(self, n_states, n_actions, n_hidden):
-        super(PolicyNetwork, self).__init__()
+        super(A2CNetwork, self).__init__()
         self.linear_input_ = nn.Linear(n_states, n_hidden)
         self.linear_mu_ = nn.Linear(n_hidden, n_actions)
         self.linear_sigma_ = nn.Linear(n_hidden, n_actions)
+        self.linear_value_ = nn.Linear(n_hidden, n_actions)
         self.action_distribution_ = torch.distributions.Normal
 
     def forward(self, x):
         x = F.relu(self.linear_input_(x))
         mu = 2 * torch.tanh(self.linear_mu_(x))
         sigma = torch.sigmoid(self.linear_sigma_(x)) + 1e-5
-        return self.action_distribution_(mu.view(1, ).data, sigma.view(1, ).data)
+        distribution = self.action_distribution_(mu.view(1, ).data, sigma.view(1, ).data)
+        value = self.linear_value_(x)
+        return distribution, value
 
 
-class PolicyEstimator(AbstractEstimator):
+class A2CEstimator(AbstractEstimator):
     def __init__(self, n_states, n_actions, n_hidden, scaler=None, gamma=0.5, learning_rate=0.001):
-        super().__init__(PolicyNetwork(n_states, n_actions, n_hidden), learning_rate)
+        super().__init__(A2CNetwork(n_states, n_actions, n_hidden), learning_rate)
         self.scaler_ = scaler
         self.gamma_ = gamma
 
@@ -43,23 +46,26 @@ class PolicyEstimator(AbstractEstimator):
         returns = (returns - returns.mean()) / (returns.std() + 1e-9)
         return returns
 
-    def update(self, rewards, log_probabilities):
+    def update(self, rewards, log_probabilities, state_values):
         returns = self.get_returns_(rewards)
-        policy_gradient = []
-        for log_probability, Gt in zip(log_probabilities, returns):
-            policy_gradient.append(-log_probability * Gt)
-        loss = torch.stack(policy_gradient).sum()
+        loss = 0
+        for log_probability, value, Gt in zip(log_probabilities, state_values, returns):
+            advantage = Gt - value.item()
+            policy_loss = -log_probability * advantage
+            value_loss = F.smooth_l1_loss(value, Gt)
+            loss += policy_loss + value_loss
         self.optimizer_.zero_grad()
         loss.backward()
         self.optimizer_.step()
 
     def get_action(self, state):
+        self.model_.training = False
         if self.scaler_ is not None:
             state = self.scaler_.transform([state])[0]
-        distribution = self.model_(torch.Tensor(state))
+        distribution, state_value = self.model_(torch.Tensor(state))
         action = distribution.sample().numpy()
         log_probability = distribution.log_prob(action[0])
-        return action, log_probability
+        return action, log_probability, state_value
 
 
 def run_scenario(env, estimator, n_episodes):
@@ -67,17 +73,19 @@ def run_scenario(env, estimator, n_episodes):
     for episode in range(n_episodes):
         log_probabilities = []
         rewards = []
+        state_values = []
         total_reward = 0
         state = env.reset()
         while True:
-            action, log_probability = estimator.get_action(state)
+            action, log_probability, state_value = estimator.get_action(state)
             action = action.clip(env.action_space.low[0], env.action_space.high[0])
             new_state, reward, is_done, _ = env.step(action)
             total_reward += reward
             log_probabilities.append(log_probability)
             rewards.append(reward)
+            state_values.append(state_value)
             if is_done:
-                estimator.update(rewards, log_probabilities)
+                estimator.update(rewards, log_probabilities, state_values)
                 print('Episode: {}, total reward: {}'.format(episode, total_reward))
                 break
             state = new_state
@@ -90,7 +98,7 @@ if __name__ == "__main__":
     #env = gym.make('Pendulum-v0')
     scaler = StandardScaler()
     scaler.fit(np.array([env.observation_space.sample() for x in range(10000)]))
-    estimator = PolicyEstimator(env.observation_space.shape[0], 1, 128, scaler)
+    estimator = A2CEstimator(env.observation_space.shape[0], 1, 128, scaler)
     total_episodes_rewards = run_scenario(env, estimator, 200)
     plt.plot(total_episodes_rewards)
     plt.title("Total reward over episode")
